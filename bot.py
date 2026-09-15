@@ -76,28 +76,32 @@ dp = Dispatcher()
 # ============================================================
 
 def search_city(query: str):
-    """
-    Ищет населённый пункт по названию через Nominatim (OpenStreetMap).
-    
-    Вход:  query — строка, например "Тверь".
-    Выход: словарь {"name": ..., "lat": ..., "lon": ...} или None, если не найдено.
-    
-    Как работает: отправляет GET-запрос к API Nominatim, получает JSON
-    с результатами и берёт первый (самый вероятный) результат.
-    """
-    url = "https://nominatim.openstreetmap.org/search"
-    
-    # Параметры запроса (после знака "?" в URL).
+    """Ищет координаты через MapTiler Geocoding API."""
+    api_key = os.getenv("MAPTILER_KEY")
+    # URL-кодируем запрос (пробелы заменяются на %20 и т.д.)
+    encoded_query = requests.utils.quote(query)
+    url = f"https://api.maptiler.com/geocoding/{encoded_query}.json"
     params = {
-        "q": query,                 # что ищем
-        "format": "json",           # в каком формате хотим ответ
-        "limit": 1,                 # взять только 1 результат
-        "accept-language": "ru"     # названия на русском
+        "key": api_key,
+        "language": "ru",
+        "limit": 1
     }
-    
-    # Nominatim требует указать User-Agent — так они отсекают ботов-спамеров.
-    # Мы честно говорим: "это учебный бот, вот его имя".
-    headers = {"User-Agent": "MyCityBot/1.0"}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("features"):
+            feat = data["features"][0]
+            # В GeoJSON координаты идут в порядке [долгота, широта]
+            lon, lat = feat["geometry"]["coordinates"]
+            return {
+                "name": feat["place_name"],
+                "lat": lat,
+                "lon": lon
+            }
+    except Exception as e:
+        logging.error(f"MapTiler search error: {e}")
+    return None
     
     try:
         # Отправляем запрос. timeout=10 — если сервер не ответит за 10 секунд,
@@ -126,37 +130,33 @@ def search_city(query: str):
 
 
 def get_area(lat: float, lon: float):
-    """
-    Определяет область (регион) по координатам.
-    Используется для проверки условия "далеко, но в той же области".
-    
-    Вход:  lat, lon — координаты.
-    Выход: строка типа "Тверская область" или None.
-    
-    Логика та же, что в search_city, но работаем в обратную сторону:
-    даём координаты — получаем название места (reverse geocoding).
-    """
-    url = "https://nominatim.openstreetmap.org/reverse"
+    """Определяет область по координатам через MapTiler Reverse Geocoding."""
+    api_key = os.getenv("MAPTILER_KEY")
+    # MapTiler принимает координаты в формате "долгота,широта"
+    url = f"https://api.maptiler.com/geocoding/{lon},{lat}.json"
     params = {
-        "lat": lat,
-        "lon": lon,
-        "format": "json",
-        "zoom": 10,                  # 10 = уровень "область" (state/region)
-        "accept-language": "ru"
+        "key": api_key,
+        "language": "ru",
+        "limit": 1,
+        "types": "region"  # просим только регионы (области, края)
     }
-    headers = {"User-Agent": "MyCityBot/1.0"}
     try:
-        response = requests.get(url, params=params, headers=headers, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        if "address" in data:
-            # Пытаемся достать "state" (область/край), если нет — "region".
-            return data["address"].get("state") or data["address"].get("region")
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("features"):
+            feat = data["features"][0]
+            # Пытаемся достать название региона из контекста
+            context = feat.get("context", [])
+            for item in context:
+                if item.get("id", "").startswith("region"):
+                    return item.get("text")
+            # Если регион не найден, возвращаем первый контекст
+            if context:
+                return context[0].get("text")
     except Exception as e:
-        logging.error(f"Ошибка определения области: {e}")
+        logging.error(f"MapTiler reverse error: {e}")
     return None
-
-
 def get_route(from_coords: dict, to_coords: dict):
     """
     Считает расстояние и время в пути по дорогам через OSRM.
