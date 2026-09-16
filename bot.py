@@ -8,7 +8,7 @@ from urllib.parse import quote
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.types import Message, BufferedInputFile
+from aiogram.types import Message
 
 from flask import Flask
 import threading
@@ -172,7 +172,7 @@ def get_area(lat: float, lon: float):
 
 
 # ============================================================
-# РАСЧЁТ МАРШРУТА (С ГЕОМЕТРИЕЙ)
+# РАСЧЁТ МАРШРУТА (OSRM)
 # ============================================================
 def get_route(from_coords, to_coords):
     url = (
@@ -180,7 +180,7 @@ def get_route(from_coords, to_coords):
         f"{from_coords['lon']},{from_coords['lat']};"
         f"{to_coords['lon']},{to_coords['lat']}"
     )
-    params = {"overview": "simplified", "geometries": "geojson"}
+    params = {"overview": "false"}
     try:
         r = requests.get(url, params=params, timeout=15)
         r.raise_for_status()
@@ -189,12 +189,11 @@ def get_route(from_coords, to_coords):
             route = data["routes"][0]
             return {
                 "distance": round(route["distance"] / 1000),
-                "duration": round(route["duration"] / 60),
-                "geometry": route.get("geometry")
+                "duration": round(route["duration"] / 60)
             }
     except Exception as e:
         logging.error(f"OSRM error: {e}")
-    return {"distance": float("inf"), "duration": 0, "geometry": None}
+    return {"distance": float("inf"), "duration": 0}
 
 
 def format_duration(minutes):
@@ -205,73 +204,6 @@ def format_duration(minutes):
     if mins == 0:
         return f"{hours} ч"
     return f"{hours} ч {mins} мин"
-
-
-# ============================================================
-# КАРТА (MapTiler Static Maps)
-# ============================================================
-def encode_polyline(coords, precision=5):
-    """Кодирует [[lat, lon], ...] в формат Google Polyline."""
-    factor = 10 ** precision
-    result = []
-    prev_lat = 0
-    prev_lon = 0
-    for lat, lon in coords:
-        lat_i = int(round(lat * factor))
-        lon_i = int(round(lon * factor))
-        d_lat = lat_i - prev_lat
-        d_lon = lon_i - prev_lon
-        prev_lat = lat_i
-        prev_lon = lon_i
-        for v in (d_lat, d_lon):
-            v = ~(v << 1) if v < 0 else (v << 1)
-            while v >= 0x20:
-                result.append(chr((0x20 | (v & 0x1f)) + 63))
-                v >>= 5
-            result.append(chr(v + 63))
-    return ''.join(result)
-
-
-def build_map_url(client_city, nearest_city, geometry):
-    api_key = os.getenv("MAPTILER_KEY")
-    if not api_key:
-        return None
-
-    base_markers = (
-        f"&markers={client_city['lon']},{client_city['lat']},red"
-        f"&markers={nearest_city['lon']},{nearest_city['lat']},blue"
-    )
-
-    if geometry:
-        try:
-            coords = geometry["coordinates"]  # [[lon, lat], ...]
-            max_points = 60
-            if len(coords) > max_points:
-                step = max(1, len(coords) // max_points)
-                coords = coords[::step]
-                if coords[-1] != geometry["coordinates"][-1]:
-                    coords.append(geometry["coordinates"][-1])
-
-            latlon = [[c[1], c[0]] for c in coords]
-            encoded = encode_polyline(latlon)
-            encoded_safe = quote(encoded, safe='')
-
-            url_with_path = (
-                f"https://api.maptiler.com/maps/streets-v2/static/auto/800x500.png"
-                f"?key={api_key}{base_markers}"
-                f"&path=weight:5|color:0x4a90e2|enc:{encoded_safe}"
-            )
-            if len(url_with_path) <= 7500:
-                return url_with_path
-            logging.warning(f"URL карты слишком длинный ({len(url_with_path)}), упрощаем")
-        except Exception as e:
-            logging.error(f"Map URL error: {e}")
-
-    # Fallback: карта без линии маршрута
-    return (
-        f"https://api.maptiler.com/maps/streets-v2/static/auto/800x500.png"
-        f"?key={api_key}{base_markers}"
-    )
 
 
 # ============================================================
@@ -318,8 +250,7 @@ async def handle_city(message: Message):
             "city": city,
             "distance": route["distance"],
             "duration": route["duration"],
-            "status": status,
-            "geometry": route.get("geometry")
+            "status": status
         })
 
     results.sort(key=lambda x: x["distance"])
@@ -334,30 +265,8 @@ async def handle_city(message: Message):
             text_lines.append(f"🔴 {name} — {dist} км")
         else:
             text_lines.append(f"⚪ {name} — {dist} км")
-    text = "\n".join(text_lines)
 
-    # Карта для ближайшего города
-    nearest = results[0]
-    map_url = build_map_url(client_city, nearest["city"], nearest.get("geometry"))
-
-    if map_url:
-        try:
-            # Скачиваем картинку сами, чтобы Telegram не ходил по URL
-            img_response = requests.get(map_url, timeout=20)
-            img_response.raise_for_status()
-
-            photo_file = BufferedInputFile(
-                img_response.content,
-                filename="map.png"
-            )
-
-            await message.answer_photo(photo=photo_file, caption=text)
-            return
-        except Exception as e:
-            logging.error(f"Не удалось отправить карту: {e}")
-
-    # Если карта не получилась — отправляем хотя бы текст
-    await message.answer(text)
+    await message.answer("\n".join(text_lines))
 
 
 # ============================================================
