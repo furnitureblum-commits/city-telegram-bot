@@ -1,8 +1,10 @@
 import asyncio
 import os
 import logging
+import sqlite3
 import requests
 from dotenv import load_dotenv
+from urllib.parse import quote
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -13,29 +15,69 @@ import threading
 
 load_dotenv()
 
+DB_FILE = "cache.db"
+
+
 # ============================================================
-# КЭШ В ПАМЯТИ
+# SQLITE КЭШ
 # ============================================================
-_cache = {}
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("""CREATE TABLE IF NOT EXISTS city_cache (
+        query TEXT PRIMARY KEY, name TEXT, lat REAL, lon REAL
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS area_cache (
+        lat REAL, lon REAL, area TEXT, PRIMARY KEY (lat, lon)
+    )""")
+    conn.commit()
+    conn.close()
+
 
 def cache_get_city(query):
-    return _cache.get(f"city:{query.lower().strip()}")
+    conn = sqlite3.connect(DB_FILE)
+    row = conn.execute(
+        "SELECT name, lat, lon FROM city_cache WHERE query = ?",
+        (query.lower().strip(),)
+    ).fetchone()
+    conn.close()
+    if row:
+        return {"name": row[0], "lat": row[1], "lon": row[2]}
+    return None
+
 
 def cache_set_city(query, name, lat, lon):
-    _cache[f"city:{query.lower().strip()}"] = {"name": name, "lat": lat, "lon": lon}
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute(
+        "INSERT OR REPLACE INTO city_cache VALUES (?, ?, ?, ?)",
+        (query.lower().strip(), name, lat, lon)
+    )
+    conn.commit()
+    conn.close()
+
 
 def cache_get_area(lat, lon):
-    return _cache.get(f"area:{round(lat, 2)},{round(lon, 2)}")
+    conn = sqlite3.connect(DB_FILE)
+    row = conn.execute(
+        "SELECT area FROM area_cache WHERE lat = ? AND lon = ?",
+        (round(lat, 2), round(lon, 2))
+    ).fetchone()
+    conn.close()
+    return row[0] if row else None
+
 
 def cache_set_area(lat, lon, area):
-    _cache[f"area:{round(lat, 2)},{round(lon, 2)}"] = area
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute(
+        "INSERT OR REPLACE INTO area_cache VALUES (?, ?, ?)",
+        (round(lat, 2), round(lon, 2), area)
+    )
+    conn.commit()
+    conn.close()
 
 
 # ============================================================
-# НОРМАЛИЗАЦИЯ НАЗВАНИЙ ОБЛАСТЕЙ
+# НОРМАЛИЗАЦИЯ ОБЛАСТЕЙ
 # ============================================================
-# Убираем слова "область", "край", "республика" и т.д., чтобы
-# "Саратовская область" и "Саратовская" считались одним и тем же.
 def normalize_area(s):
     if not s:
         return ""
@@ -46,7 +88,7 @@ def normalize_area(s):
 
 
 # ============================================================
-# СПИСОК ГОРОДОВ С ОБЛАСТЯМИ
+# СПИСОК ГОРОДОВ
 # ============================================================
 CITIES = [
     {"name": "Москва", "lat": 55.7558, "lon": 37.6173, "area": "Москва"},
@@ -68,7 +110,7 @@ dp = Dispatcher()
 
 
 # ============================================================
-# ПОИСК ГОРОДА (С КЭШЕМ)
+# ПОИСК ГОРОДА
 # ============================================================
 def search_city(query: str):
     cached = cache_get_city(query)
@@ -77,7 +119,7 @@ def search_city(query: str):
         return cached
 
     api_key = os.getenv("MAPTILER_KEY")
-    encoded_query = requests.utils.quote(query)
+    encoded_query = quote(query)
     url = f"https://api.maptiler.com/geocoding/{encoded_query}.json"
     params = {"key": api_key, "language": "ru", "limit": 1}
     try:
@@ -96,7 +138,7 @@ def search_city(query: str):
 
 
 # ============================================================
-# ОПРЕДЕЛЕНИЕ ОБЛАСТИ (С КЭШЕМ)
+# ОПРЕДЕЛЕНИЕ ОБЛАСТИ
 # ============================================================
 def get_area(lat: float, lon: float):
     cached = cache_get_area(lat, lon)
@@ -130,7 +172,7 @@ def get_area(lat: float, lon: float):
 
 
 # ============================================================
-# РАСЧЁТ МАРШРУТА (OSRM)
+# РАСЧЁТ МАРШРУТА (С ГЕОМЕТРИЕЙ)
 # ============================================================
 def get_route(from_coords, to_coords):
     url = (
@@ -138,7 +180,7 @@ def get_route(from_coords, to_coords):
         f"{from_coords['lon']},{from_coords['lat']};"
         f"{to_coords['lon']},{to_coords['lat']}"
     )
-    params = {"overview": "false"}
+    params = {"overview": "simplified", "geometries": "geojson"}
     try:
         r = requests.get(url, params=params, timeout=15)
         r.raise_for_status()
@@ -147,11 +189,12 @@ def get_route(from_coords, to_coords):
             route = data["routes"][0]
             return {
                 "distance": round(route["distance"] / 1000),
-                "duration": round(route["duration"] / 60)
+                "duration": round(route["duration"] / 60),
+                "geometry": route.get("geometry")
             }
     except Exception as e:
         logging.error(f"OSRM error: {e}")
-    return {"distance": float("inf"), "duration": 0}
+    return {"distance": float("inf"), "duration": 0, "geometry": None}
 
 
 def format_duration(minutes):
@@ -162,6 +205,69 @@ def format_duration(minutes):
     if mins == 0:
         return f"{hours} ч"
     return f"{hours} ч {mins} мин"
+
+
+# ============================================================
+# КАРТА (MapTiler Static Maps)
+# ============================================================
+def encode_polyline(coords, precision=5):
+    """Кодирует [[lat, lon], ...] в формат Google Polyline."""
+    factor = 10 ** precision
+    result = []
+    prev_lat = 0
+    prev_lon = 0
+    for lat, lon in coords:
+        lat_i = int(round(lat * factor))
+        lon_i = int(round(lon * factor))
+        d_lat = lat_i - prev_lat
+        d_lon = lon_i - prev_lon
+        prev_lat = lat_i
+        prev_lon = lon_i
+        for v in (d_lat, d_lon):
+            v = ~(v << 1) if v < 0 else (v << 1)
+            while v >= 0x20:
+                result.append(chr((0x20 | (v & 0x1f)) + 63))
+                v >>= 5
+            result.append(chr(v + 63))
+    return ''.join(result)
+
+
+def build_map_url(client_city, nearest_city, geometry):
+    api_key = os.getenv("MAPTILER_KEY")
+    if not api_key or not geometry:
+        return None
+    try:
+        coords = geometry["coordinates"]  # [[lon, lat], ...]
+        max_points = 60
+        if len(coords) > max_points:
+            step = max(1, len(coords) // max_points)
+            coords = coords[::step]
+            if coords[-1] != geometry["coordinates"][-1]:
+                coords.append(geometry["coordinates"][-1])
+
+        latlon = [[c[1], c[0]] for c in coords]
+        encoded = encode_polyline(latlon)
+        encoded_safe = quote(encoded, safe='')
+
+        url = (
+            f"https://api.maptiler.com/maps/streets-v2/static/auto/800x500.png"
+            f"?key={api_key}"
+            f"&markers={client_city['lon']},{client_city['lat']},red"
+            f"&markers={nearest_city['lon']},{nearest_city['lat']},blue"
+            f"&path=weight:5|color:0x4a90e2|enc:{encoded_safe}"
+        )
+        if len(url) > 2000:
+            logging.warning(f"URL карты слишком длинный ({len(url)}), упрощаем")
+            url = (
+                f"https://api.maptiler.com/maps/streets-v2/static/auto/800x500.png"
+                f"?key={api_key}"
+                f"&markers={client_city['lon']},{client_city['lat']},red"
+                f"&markers={nearest_city['lon']},{nearest_city['lat']},blue"
+            )
+        return url
+    except Exception as e:
+        logging.error(f"Map URL error: {e}")
+        return None
 
 
 # ============================================================
@@ -187,7 +293,7 @@ async def handle_city(message: Message):
 
     client_city = search_city(city_name)
     if not client_city:
-        await message.answer("😔 Не удалось найти такой населённый пункт. Попробуй написать по-другому.")
+        await message.answer("😔 Не удалось найти такой населённый пункт.")
         return
 
     client_area = normalize_area(get_area(client_city["lat"], client_city["lon"]))
@@ -208,7 +314,8 @@ async def handle_city(message: Message):
             "city": city,
             "distance": route["distance"],
             "duration": route["duration"],
-            "status": status
+            "status": status,
+            "geometry": route.get("geometry")
         })
 
     results.sort(key=lambda x: x["distance"])
@@ -218,14 +325,25 @@ async def handle_city(message: Message):
         name = res["city"]["name"]
         dist = res["distance"]
         if res["status"] == "green":
-            time_str = format_duration(res["duration"])
-            text_lines.append(f"🟢 {name} — {dist} км ({time_str})")
+            text_lines.append(f"🟢 {name} — {dist} км ({format_duration(res['duration'])})")
         elif res["status"] == "red":
             text_lines.append(f"🔴 {name} — {dist} км")
         else:
             text_lines.append(f"⚪ {name} — {dist} км")
+    text = "\n".join(text_lines)
 
-    await message.answer("\n".join(text_lines))
+    # Карта для ближайшего города
+    nearest = results[0]
+    map_url = build_map_url(client_city, nearest["city"], nearest.get("geometry"))
+
+    if map_url:
+        try:
+            await message.answer_photo(photo=map_url, caption=text)
+            return
+        except Exception as e:
+            logging.error(f"Не удалось отправить карту: {e}")
+
+    await message.answer(text)
 
 
 # ============================================================
@@ -247,8 +365,9 @@ def run_flask():
 
 
 async def main():
+    init_db()
     await bot.delete_webhook(drop_pending_updates=True)
-    print("Бот запущен! Отправь ему сообщение в Telegram.")
+    print("Бот запущен!")
     await dp.start_polling(bot)
 
 
