@@ -8,7 +8,7 @@ from urllib.parse import quote
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import Message, BufferedInputFile
 
 from flask import Flask
 import threading
@@ -234,40 +234,44 @@ def encode_polyline(coords, precision=5):
 
 def build_map_url(client_city, nearest_city, geometry):
     api_key = os.getenv("MAPTILER_KEY")
-    if not api_key or not geometry:
+    if not api_key:
         return None
-    try:
-        coords = geometry["coordinates"]  # [[lon, lat], ...]
-        max_points = 60
-        if len(coords) > max_points:
-            step = max(1, len(coords) // max_points)
-            coords = coords[::step]
-            if coords[-1] != geometry["coordinates"][-1]:
-                coords.append(geometry["coordinates"][-1])
 
-        latlon = [[c[1], c[0]] for c in coords]
-        encoded = encode_polyline(latlon)
-        encoded_safe = quote(encoded, safe='')
+    base_markers = (
+        f"&markers={client_city['lon']},{client_city['lat']},red"
+        f"&markers={nearest_city['lon']},{nearest_city['lat']},blue"
+    )
 
-        url = (
-            f"https://api.maptiler.com/maps/streets-v2/static/auto/800x500.png"
-            f"?key={api_key}"
-            f"&markers={client_city['lon']},{client_city['lat']},red"
-            f"&markers={nearest_city['lon']},{nearest_city['lat']},blue"
-            f"&path=weight:5|color:0x4a90e2|enc:{encoded_safe}"
-        )
-        if len(url) > 2000:
-            logging.warning(f"URL карты слишком длинный ({len(url)}), упрощаем")
-            url = (
+    if geometry:
+        try:
+            coords = geometry["coordinates"]  # [[lon, lat], ...]
+            max_points = 60
+            if len(coords) > max_points:
+                step = max(1, len(coords) // max_points)
+                coords = coords[::step]
+                if coords[-1] != geometry["coordinates"][-1]:
+                    coords.append(geometry["coordinates"][-1])
+
+            latlon = [[c[1], c[0]] for c in coords]
+            encoded = encode_polyline(latlon)
+            encoded_safe = quote(encoded, safe='')
+
+            url_with_path = (
                 f"https://api.maptiler.com/maps/streets-v2/static/auto/800x500.png"
-                f"?key={api_key}"
-                f"&markers={client_city['lon']},{client_city['lat']},red"
-                f"&markers={nearest_city['lon']},{nearest_city['lat']},blue"
+                f"?key={api_key}{base_markers}"
+                f"&path=weight:5|color:0x4a90e2|enc:{encoded_safe}"
             )
-        return url
-    except Exception as e:
-        logging.error(f"Map URL error: {e}")
-        return None
+            if len(url_with_path) <= 7500:
+                return url_with_path
+            logging.warning(f"URL карты слишком длинный ({len(url_with_path)}), упрощаем")
+        except Exception as e:
+            logging.error(f"Map URL error: {e}")
+
+    # Fallback: карта без линии маршрута
+    return (
+        f"https://api.maptiler.com/maps/streets-v2/static/auto/800x500.png"
+        f"?key={api_key}{base_markers}"
+    )
 
 
 # ============================================================
@@ -338,11 +342,21 @@ async def handle_city(message: Message):
 
     if map_url:
         try:
-            await message.answer_photo(photo=map_url, caption=text)
+            # Скачиваем картинку сами, чтобы Telegram не ходил по URL
+            img_response = requests.get(map_url, timeout=20)
+            img_response.raise_for_status()
+
+            photo_file = BufferedInputFile(
+                img_response.content,
+                filename="map.png"
+            )
+
+            await message.answer_photo(photo=photo_file, caption=text)
             return
         except Exception as e:
             logging.error(f"Не удалось отправить карту: {e}")
 
+    # Если карта не получилась — отправляем хотя бы текст
     await message.answer(text)
 
 
